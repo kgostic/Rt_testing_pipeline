@@ -1,0 +1,241 @@
+---
+title: "Test Rt estimates against synthetic data"
+output: html_notebook
+---
+
+Notebook by Katie Gostic
+
+Last updated: 5-11-2020
+
+
+
+Estimate $R_t$ using methods from Cori et al. _American Journal of Epidemiology_, 2013.
+
+
+## Synthetic data:
+
+1. Generate synthetic data on infection incidence (# infected per day) using a stochastic SEIR model in which the true underlying transmission rate drops from R0 = 2.0 to R0 = 0.8 in response to a simulated shelter in place scenario, and then rises again to R0 = 1.15 in response to loosening of restrictions 45 days later. (The actual R0 values input, and the times at which they change are arbitrary, and can be changed).
+
+     * Mean residence time in E ($\frac{1}{\sigma}$) is 4 days
+     * Mean residence time in I ($\frac{1}{\lambda}$) is 4 days
+     * The serial interval (SI) distribution is gamma(shape = 2, rate = 1/4). (Sum of two iid exponential RVs with rate = 1/4, one for residence time in E, and one for residence time in I.)
+     
+2. Using a known distribution of delays from infection to observation, impute the number of cases observed on a given day (this forward imputation step mimics how data is observed in the real world--individuals infected on day $x$ are not observed until several days later, when they become symptomatic and seek medical care).
+3. To estimate $R_t$ we need to take the observed case data and impute times of infection. For now, subtract the mean delay to observation. Later, use Laruen's deconvolution method.
+4. Estimate $R_t$ using the Cori method and compare to true, underlying $R_t$ values.
+5. Compare lags in $R_t$ estimates given different delays to observation.
+     
+
+```{r}
+rm(list = ls())
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(readr)
+library(cowplot)
+library(EpiEstim)
+theme_set(theme_bw())
+knitr::opts_chunk$set(message = FALSE)
+```
+
+## Set parameters for SEIR simulation
+
+```{r}
+## Set parameters to simulate SEIR epidemic
+parlist <- {
+  list(
+    N = 2e6, #total population size
+    E_init = 0,
+    I_init = 10,
+    t_E = 4, # mean time in E (latent period)
+    t_I = 4, # mean time in I (duration of infectiousness)
+    n_t = 300, # total timesteps
+    pre_intervention_R0 = 3.5, # Initial R0 before interventions
+    intervention_R0 = 0.8, # Final R0 after interventions
+    partially_lifeted_R0 = 1.15,
+    intervention_time_1 = 30, # Timepoint at which intervention starts (at which underlying transmission rate begins to fall)
+    intervention_time_2 = 30+45,
+    days_intervention_to_min = c(7), # Days from intervention start until transmission rate hits min_R0
+    days_to_Rt_rise = 7,
+    model_types = c('seir'), # Can also choose sir
+    methods = c('stochastic') # could also choose ode
+  )
+}
+
+## Derive the mean and variance of the serial interval from the input parameters
+parlist$true_mean_SI = (parlist$t_E+parlist$t_I)
+parlist$true_var_SI = 2*parlist$true_mean_SI^2
+```
+
+## Simulate SEIR data
+
+```{r}
+## Simulate SEIR data using a stochastic (ode) model
+## Results are saved to a subdirectory called 'R0-xx.xx/'
+source('funs_simulation-sweep.R')
+sim_sweep(parlist)
+testplots(parlist)
+```
+
+## Extract SEIR simulation and plot.
+
+- Incidence here is observed at time of infection (S -> E).
+- SEIR simulation is stochastic.
+
+```{r}
+## Write a function to extract the simulation results as a data frame
+get_sim_df <- function(){
+  readRDS(sprintf('R0-%.1f/seir_%s_dec%.0f-%.0f_sim.rds', 
+                  parlist$pre_intervention_R0, 
+                  parlist$methods,
+                  parlist$intervention_time_1, 
+                  parlist$days_intervention_to_min))$sim_df 
+}
+
+get_sim_df() %>%
+ggplot() +
+  geom_line(aes(x = time, y = incidence))+
+  geom_vline(aes(xintercept = parlist$intervention_time_1), lty = 2)+ ## Dahsed line where Rt starts to decrease
+    geom_vline(aes(xintercept = parlist$intervention_time_2), lty = 2)+ ## Dahsed line where Rt starts to decrease
+  ggtitle('Daily incidence, SEIR simulation') -> inc
+
+get_sim_df() %>% 
+  ggplot()+
+  geom_line(aes(x = time, y = true_r0)) +
+  geom_hline(aes(yintercept = 1), lty = 2)+
+  ylab('R0')+
+  ggtitle('Underlying R0 values') -> R0
+
+plot_grid(R0, inc, align = 'hv', nrow = 2)
+```
+
+## Set the delay distribution
+```{r}
+##   This function draws random samples of size nn from the delay distribution
+##     Choice of delay distribution is arbitrary
+obs_delay_dist <- function(nn){
+  r_inc_dist <- function(n){rgamma(n, shape = 5.8, scale = 0.95)} # Incubation period based on values in the literature (infection -> symptoms)
+  r_sym_to_obs_dist <- function(n){runif(n, 0, 4)} # Assume an additional reporting delay of 0-4 d
+  r_inc_dist(nn) + r_sym_to_obs_dist(nn) ## Sample total delay
+}
+```
+
+
+## Forward step: Impute times of observation from SEIR times of infection 
+
+```{r}
+source('funs_impute_obs_times.R')
+## write the simulation outputs to a data frame and clean
+sim_df <- get_sim_df() %>%
+  mutate(true_infections = ifelse(is.na(dS), 0, dS)) # Replace NAs with 0s
+
+## Impute times of observation based on the delay distribution and merge in to the simulation data frame
+sim_df <- merge(
+  sim_df,
+  get_tObs_from_tInf(sim_df$true_infections, sim_df$time, obs_delay_dist, return_times = T),
+  by = 'time', all = TRUE
+) %>% 
+  rename(imputed_observations = n) %>%
+  as.tbl()
+```
+
+## Visualize forward imputation step
+```{r}
+sim_df %>%
+  select(time, true_infections, imputed_observations) %>%
+  pivot_longer(-time, names_to = 'data_type', values_to = 'count') %>%
+  ggplot() +
+  geom_line(aes(x = time, y = count, color = data_type)) +
+  ggtitle('Forward imputation')
+```
+
+## Backward imputation step: Get times of infection from times of observation
+
+- Currently subtracting the mean delay to observation.
+- Soon will use Lauren's deconvolution method.
+
+```{r fig.height}
+## Impute infection times
+raw_df <- sim_df %>%
+  ## Impute n infected per day from n observed per day
+  mutate(imputed_infections = 
+           move_back_in_time(n_obs = imputed_observations, mean_delay = mean(obs_delay_dist(1000)))) %>%
+  select(time, true_rt, true_infections, imputed_observations, imputed_infections) 
+
+raw_df %>%
+  pivot_longer(3:ncol(.)) %>%
+  ggplot()+
+  geom_line(aes(x = time, y = value, color = name))+
+  ggtitle('Backward imputation')
+```
+
+## Write function to estimate $R_t$
+-  df.in is an data frame containing a column, "time" giving time in days, and a column with any name giving the number of infections per day 
+-  icol_name is a string specifying the name of the column that holds the incidence data
+-  window sets the window width
+-  SI_mean gives the assumed mean SI
+-  SI_var gives the assumed SI variance
+```{r}
+## Output cori estimate with mean, CI and times given an input df, and the name of the incidence column
+get_cori <- function(df.in, icol_name, window = 4, SI_mean=parlist$true_mean_SI, SI_var=2*(parlist$true_mean_SI/2)^2){
+  idat <- df.in %>%
+    filter(get(icol_name) > 0 & !is.na(get(icol_name))) %>%
+    complete(time = 2:max(time))%>%
+    mutate_all(.funs = function(xx){ifelse(is.na(xx), 0, xx)})
+  
+  ts <- idat$time
+  ts <- ts[ts > 1 & ts < (max(ts)-window+1)]
+  te<- ts+(window-1)
+  
+  estimate_R(
+    incid = pull(idat, eval(icol_name)),
+    method = "uncertain_si",
+    config = make_config(
+      list(
+        mean_si = SI_mean,
+        min_mean_si = SI_mean -1,
+        max_mean_si = SI_mean + 1,
+        std_mean_si = 1.5,
+        std_std_si = 1.5,
+        std_si = sqrt(SI_var),
+        min_std_si = sqrt(SI_var)*.8,
+        max_std_si = sqrt(SI_var)*1.2,
+        n1 = 50,
+        n2 = 100, 
+        t_start=ts,
+        t_end=te
+        )
+      )
+    ) -> outs
+  
+  outs$R %>%
+    select(t_end, `Mean(R)`, `Quantile.0.025(R)`, `Quantile.0.975(R)`) %>%
+    setNames(c('time', paste0(icol_name, '.mean'), paste0(icol_name, '.025'), paste0(icol_name, '.975')))
+}
+```
+
+
+## Estimate Rt using data on true infections, and imputed infections
+
+```{r}
+wdw <- 1 ## Set smoothing window = 1d
+rt_df <- raw_df %>%
+  merge(get_cori(raw_df, icol_name = 'true_infections', window = wdw), by = 'time') %>%  ## Add Rt fit to true infection incidence
+  merge(get_cori(raw_df, icol_name = 'imputed_infections', window = wdw), by = 'time')# %>% ## Add fit to imputed incidence
+```
+
+## Plot the outputs
+```{r}
+rt_df %>%
+  pivot_longer(5:ncol(.), names_to = c('kind', '.value'), names_sep = '\\.') %>%
+  # mutate(name = factor(name, levels = c('true_inf', 'inf_from_obs_rv', 'inf_from_obs_mean', ), 
+  #                      labels = c('exact from SEIR', 'imputed from observed [dist]', 'imputed from observed [mean]'))) %>%
+  filter(!is.na(mean)) %>%
+  ggplot() +
+  geom_line(aes(x = time, y = true_rt), lwd = 1)+
+  geom_line(aes(x = time, y = mean, color = kind)) +
+  geom_ribbon(aes(x = time, ymin = `025`, ymax = `975`, fill = kind), alpha = 0.3)+
+  xlab('count') +
+  ggtitle('Rt estimates vs. true value', subtitle = 'Black line shows true Rt used in SEIR sim')
+```
+
